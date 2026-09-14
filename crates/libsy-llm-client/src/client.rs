@@ -5,14 +5,13 @@
 //! request, call the configured backend over HTTP, decode the neutral response.
 
 use std::collections::{BTreeMap, HashMap};
-use std::future::ready;
 use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
 use http::StatusCode;
 use reqwest::RequestBuilder;
-use reqwest::header::{HeaderMap, RETRY_AFTER};
+use reqwest::header::{CONTENT_TYPE, HeaderMap, RETRY_AFTER};
 use serde_json::{Map, Value};
 use switchyard_protocol::{
     LlmRequest, LlmResponse, LlmResponseChunk, LlmResponseStreamEvent, Metadata, ModelId, Request,
@@ -359,10 +358,16 @@ impl TranslatingLlmClient {
         };
         let status = response.status();
         if status.is_success() {
-            if streaming {
+            let response_is_event_stream = is_event_stream(response.headers());
+            if streaming || response_is_event_stream {
                 // Streaming body failures happen after the retry boundary.
                 metrics::record_upstream_attempt(Some(status.as_u16()));
-                return Ok(EncodedResponse::Streaming(response));
+                return Ok(EncodedResponse::Streaming {
+                    response,
+                    // Some proxies stream every upstream response even when the request
+                    // explicitly asks for a buffered one. Preserve the caller's contract.
+                    aggregate: !streaming,
+                });
             }
             let body = match response.bytes().await {
                 Ok(body) => body,
@@ -466,7 +471,10 @@ impl TranslatingLlmClient {
             .await?;
 
         let llm_response = match http_response {
-            EncodedResponse::Streaming(http_response) => {
+            EncodedResponse::Streaming {
+                response: http_response,
+                aggregate,
+            } => {
                 // Adapt the reqwest body stream to plain bytes; the SSE-decode itself is
                 // transport-agnostic and lives in `switchyard-translation`.
                 let bytes = http_response.bytes_stream().map(|chunk| {
@@ -475,21 +483,32 @@ impl TranslatingLlmClient {
                         .map_err(convert_reqwest_error)
                 });
                 let mut chunks = decode_stream(bytes, wire_format)?;
-                // Providers reject an over-ceiling streaming request with an in-band
-                // error event on an HTTP 200. Classify the first event before returning
-                // the stream: nothing has reached the caller yet, so an overflow can
-                // still fail the call and let routing try the next candidate.
-                match chunks.next().await {
-                    None => LlmResponse::Stream(stream::empty().boxed()),
-                    Some(first) => {
-                        if let Some(message) = first_event_overflow(&first, backend) {
-                            return Err(LlmClientError::ContextWindowExceeded {
-                                model: model_id.clone(),
-                                message,
-                            });
-                        }
-                        LlmResponse::Stream(stream::once(ready(first)).chain(chunks).boxed())
+                // Providers reject an over-ceiling streaming request with an in-band error
+                // event on an HTTP 200, and send it after the events that open the stream.
+                // Classify every opening event before returning the stream: nothing has
+                // reached the caller yet, so an overflow can still fail the call and let
+                // routing try the next candidate.
+                let mut opening = Vec::new();
+                let response = loop {
+                    let Some(event) = chunks.next().await else {
+                        break LlmResponse::Stream(stream::iter(opening).boxed());
+                    };
+                    if let Some(message) = event_overflow(&event, backend) {
+                        return Err(LlmClientError::ContextWindowExceeded {
+                            model: model_id.clone(),
+                            message,
+                        });
                     }
+                    let opens_the_response = opens_the_response(&event);
+                    opening.push(event);
+                    if !opens_the_response {
+                        break LlmResponse::Stream(stream::iter(opening).chain(chunks).boxed());
+                    }
+                };
+                if aggregate {
+                    LlmResponse::Agg(response.into_agg().await?)
+                } else {
+                    response
                 }
             }
             EncodedResponse::Buffered { body, .. } => {
@@ -606,17 +625,31 @@ impl UpstreamEndpoint {
 }
 
 enum EncodedResponse {
-    Buffered { status: u16, body: Vec<u8> },
-    Streaming(reqwest::Response),
+    Buffered {
+        status: u16,
+        body: Vec<u8>,
+    },
+    Streaming {
+        response: reqwest::Response,
+        aggregate: bool,
+    },
 }
 
 impl EncodedResponse {
     fn status(&self) -> u16 {
         match self {
             EncodedResponse::Buffered { status, .. } => *status,
-            EncodedResponse::Streaming(response) => response.status().as_u16(),
+            EncodedResponse::Streaming { response, .. } => response.status().as_u16(),
         }
     }
+}
+
+fn is_event_stream(headers: &HeaderMap) -> bool {
+    headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/event-stream"))
 }
 
 // The typed error decides retry eligibility; status and Retry-After feed
@@ -639,13 +672,10 @@ impl AttemptFailure {
     }
 }
 
-// The overflow message when a stream's first event is an in-band provider rejection
-// of the whole request, rather than the start of a response.
-fn first_event_overflow(
-    first: &Result<LlmResponseStreamEvent>,
-    backend: &Backend,
-) -> Option<String> {
-    first
+// The overflow message when a stream event is an in-band provider rejection of the
+// whole request, rather than part of a response.
+fn event_overflow(event: &Result<LlmResponseStreamEvent>, backend: &Backend) -> Option<String> {
+    event
         .as_ref()
         .ok()?
         .normalized()
@@ -656,6 +686,18 @@ fn first_event_overflow(
             }
             _ => None,
         })
+}
+
+// Whether an event only opens the response. Providers start a stream with lifecycle
+// events that decode to `MessageStart` or to nothing at all; content, usage, a stop, and
+// an error all end the opening.
+fn opens_the_response(event: &Result<LlmResponseStreamEvent>) -> bool {
+    event.as_ref().is_ok_and(|event| {
+        event
+            .normalized()
+            .iter()
+            .all(|chunk| matches!(chunk, LlmResponseChunk::MessageStart { .. }))
+    })
 }
 
 // Uses Retry-After when supplied, capped so an upstream cannot stall a request indefinitely.
@@ -1853,6 +1895,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn non_streaming_request_aggregates_event_stream_response()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        let sse = "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt\"}}\n\n\
+             data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"classified\"}\n\n\
+             data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n\
+             data: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .and(|request: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+                body.get("stream").is_none()
+            })
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream; charset=utf-8"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = TranslatingLlmClient::new(&responses_map(&format!("{}/v1", server.uri())))?;
+        let response = client
+            .call_rewrite_model(request_for(Some("gpt"), false), None)
+            .await?;
+
+        assert!(matches!(response.llm_response, LlmResponse::Agg(_)));
+        let agg = response.llm_response.into_agg().await?;
+        assert_eq!(completion_text(&agg), "classified");
+        assert_eq!(agg.usage.total_tokens, Some(2));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn streaming_openai_chat_aggregates()
     -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
         let server = MockServer::start().await;
@@ -2211,6 +2285,67 @@ mod tests {
 
         let Err(error) = client
             .call_rewrite_model(request_for(Some("gpt"), false), None)
+            .await
+        else {
+            panic!("expected an error");
+        };
+        assert!(matches!(
+            error,
+            LlmClientError::ContextWindowExceeded { model, .. } if model == "gpt"
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn responses_stream_litellm_overflow_event_is_mapped()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        let sse = "data: {\"error\":{\"message\":\"Your input exceeds the context window of this model. Please adjust your input and try again.\",\"type\":\"None\",\"param\":\"None\",\"code\":400}}\n\ndata: [DONE]\n\n";
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+            .mount(&server)
+            .await;
+
+        let client = TranslatingLlmClient::new(&responses_map(&format!("{}/v1", server.uri())))?;
+        let Err(error) = client
+            .call_rewrite_model(request_for(Some("gpt"), true), None)
+            .await
+        else {
+            panic!("expected an error");
+        };
+        assert!(matches!(
+            error,
+            LlmClientError::ContextWindowExceeded { model, .. } if model == "gpt"
+        ));
+        Ok(())
+    }
+
+    // The ChatGPT backend opens the stream before it rejects an over-long request, so the
+    // overflow event is not the first one. It must still fail the call, not reach the caller.
+    #[tokio::test]
+    async fn responses_stream_overflow_after_the_opening_events_is_mapped()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        let sse = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt\"}}\n\n",
+            "event: response.in_progress\n",
+            "data: {\"type\":\"response.in_progress\",\"response\":{\"id\":\"resp_1\"}}\n\n",
+            "event: error\n",
+            "data: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",",
+            "\"code\":\"context_length_exceeded\",\"message\":\"Your input exceeds the ",
+            "context window of this model.\"}}\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+            .mount(&server)
+            .await;
+
+        let client = TranslatingLlmClient::new(&responses_map(&format!("{}/v1", server.uri())))?;
+        let Err(error) = client
+            .call_rewrite_model(request_for(Some("gpt"), true), None)
             .await
         else {
             panic!("expected an error");
