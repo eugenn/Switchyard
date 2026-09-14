@@ -147,7 +147,18 @@ pub fn encode_stream_with_extensions(
 
     let events = try_stream! {
         while let Some(item) = chunks.next().await {
-            let event = item.map_err(LlmStreamError::Client)?;
+            // Responses clients require a terminal `response.failed` event. Convert a
+            // transport/decoder failure into a neutral stream error so the Responses
+            // codec can build that event from the state accumulated so far.
+            let event = match item {
+                Ok(event) => event,
+                Err(error) if target == WireFormat::OpenAiResponses => {
+                    LlmResponseStreamEvent::new(vec![LlmResponseChunk::StreamError {
+                        message: error.to_string(),
+                    }])
+                }
+                Err(error) => Err(LlmStreamError::Client(error))?,
+            };
             let mut encoded =
                 encode_response_stream_event(&mut state, codec.as_ref(), &target_format, event);
             for value in &mut encoded {
@@ -288,18 +299,29 @@ where
                         break;
                     }
                     sse::SseFrame::Data(value) => {
-                        saw_terminal |= sse::is_terminal_event(source, &value);
+                        let terminal = sse::is_terminal_event(source, &value);
+                        saw_terminal |= terminal;
                         let normalized = codec.decode_event(&mut state, &value);
-                        saw_error |= normalized.iter().any(|chunk| matches!(
+                        let errored = normalized.iter().any(|chunk| matches!(
                             chunk,
                             LlmResponseChunk::DecodeError { .. }
                                 | LlmResponseChunk::StreamError { .. }
                         ));
-                        yield LlmResponseStreamEvent::preserved(
-                            source_format.clone(),
-                            value,
-                            normalized,
-                        );
+                        saw_error |= errored;
+                        yield if errored && !terminal {
+                            // An error event the format does not count as terminal must not
+                            // reach a same-format client verbatim: replaying it ends the
+                            // stream with no terminal event, which such a client reports as a
+                            // dropped connection. Without preservation the target codec
+                            // builds the terminal failure instead.
+                            LlmResponseStreamEvent::new(normalized)
+                        } else {
+                            LlmResponseStreamEvent::preserved(
+                                source_format.clone(),
+                                value,
+                                normalized,
+                            )
+                        };
                     }
                 }
             } else {
@@ -319,14 +341,20 @@ where
                     saw_terminal |= source != WireFormat::AnthropicMessages;
                 }
                 sse::SseFrame::Data(value) => {
-                    saw_terminal |= sse::is_terminal_event(source, &value);
+                    let terminal = sse::is_terminal_event(source, &value);
+                    saw_terminal |= terminal;
                     let normalized = codec.decode_event(&mut state, &value);
-                    saw_error |= normalized.iter().any(|chunk| matches!(
+                    let errored = normalized.iter().any(|chunk| matches!(
                         chunk,
                         LlmResponseChunk::DecodeError { .. }
                             | LlmResponseChunk::StreamError { .. }
                     ));
-                    yield LlmResponseStreamEvent::preserved(source_format, value, normalized);
+                    saw_error |= errored;
+                    yield if errored && !terminal {
+                        LlmResponseStreamEvent::new(normalized)
+                    } else {
+                        LlmResponseStreamEvent::preserved(source_format, value, normalized)
+                    };
                 }
                 sse::SseFrame::Empty => {}
             }
@@ -548,6 +576,42 @@ mod tests {
         let results =
             block_on(encode_stream(chunks, WireFormat::OpenAiChat, None)?.collect::<Vec<_>>());
         assert!(results.iter().any(Result::is_err));
+        Ok(())
+    }
+
+    #[test]
+    fn responses_stream_converts_chunk_errors_to_response_failed() -> Result<(), BoxError> {
+        let chunks: LlmResponseStream =
+            stream::iter(vec![Err::<LlmResponseStreamEvent, LlmClientError>(
+                LlmClientError::ResponseTranslation("stream ended early".to_string()),
+            )])
+            .boxed();
+
+        let events = block_on(
+            encode_stream(
+                chunks,
+                WireFormat::OpenAiResponses,
+                Some("served".to_string()),
+            )?
+            .collect::<Vec<_>>(),
+        );
+
+        let [Ok(created), Err(LlmStreamError::Upstream(event))] = events.as_slice() else {
+            return Err(
+                format!("expected response.created then response.failed, got {events:?}").into(),
+            );
+        };
+        assert_eq!(created["type"], "response.created");
+        assert_eq!(created["sequence_number"], 0);
+        assert_eq!(event["type"], "response.failed");
+        assert_eq!(event["response"]["status"], "failed");
+        assert_eq!(event["response"]["model"], "served");
+        assert_eq!(event["response"]["error"]["code"], "server_error");
+        assert_eq!(
+            event["response"]["error"]["message"],
+            "response translation failed: stream ended early"
+        );
+        assert_eq!(event["sequence_number"], 1);
         Ok(())
     }
 
@@ -877,6 +941,51 @@ mod tests {
                 "type": "response.failed",
                 "response": {"error": {"message": "upstream failed"}}
             })
+        );
+        Ok(())
+    }
+
+    // The ChatGPT backend rejects an over-long request inside an HTTP 200 stream, as a
+    // non-terminal `error` event followed by `response.failed`. A same-format client must
+    // still end on a terminal event, so the error event is rebuilt instead of replayed.
+    #[test]
+    fn responses_error_event_becomes_a_terminal_failure() -> Result<(), BoxError> {
+        let sse = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"m\"}}\n\n",
+            "event: error\n",
+            "data: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",",
+            "\"code\":\"context_length_exceeded\",\"message\":\"Your input exceeds the ",
+            "context window of this model.\"}}\n\n",
+        )
+        .as_bytes()
+        .to_vec();
+        let bytes = stream::once(async move { Ok::<Vec<u8>, LlmClientError>(sse) });
+        let events = decode_all(bytes, WireFormat::OpenAiResponses)?;
+
+        let chunks: LlmResponseStream = stream::iter(
+            events
+                .into_iter()
+                .map(Ok::<LlmResponseStreamEvent, LlmClientError>),
+        )
+        .boxed();
+        let encoded =
+            block_on(encode_stream(chunks, WireFormat::OpenAiResponses, None)?.collect::<Vec<_>>());
+
+        let [Ok(created), Err(LlmStreamError::Upstream(failed))] = encoded.as_slice() else {
+            return Err(
+                format!("expected response.created then response.failed, got {encoded:?}").into(),
+            );
+        };
+        assert_eq!(created["type"], "response.created");
+        assert_eq!(failed["type"], "response.failed");
+        assert_eq!(failed["response"]["status"], "failed");
+        let message = failed["response"]["error"]["message"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            message.contains("exceeds the context window"),
+            "the provider message was lost: {failed}"
         );
         Ok(())
     }
