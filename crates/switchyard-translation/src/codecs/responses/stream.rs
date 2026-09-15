@@ -288,15 +288,25 @@ fn decode_responses_stream(
                 .unwrap_or("unknown Responses stream error")
                 .to_string(),
         }],
-        Some("error") => vec![LlmResponseChunk::StreamError {
-            message: event
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown Responses stream error")
-                .to_string(),
-        }],
+        Some("error") => decode_responses_error_event(event),
+        // LiteLLM emits proxy failures as `{"error": {...}}` without a Responses
+        // event type, including context-window rejections delivered over HTTP 200.
+        None if event.get("error").is_some() => decode_responses_error_event(event),
         _ => Vec::new(),
     }
+}
+
+// Extracts both native top-level messages and OpenAI-compatible nested error objects.
+fn decode_responses_error_event(event: &Value) -> Vec<LlmResponseChunk> {
+    vec![LlmResponseChunk::StreamError {
+        message: event
+            .get("error")
+            .and_then(|error| error.get("message"))
+            .or_else(|| event.get("message"))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown Responses stream error")
+            .to_string(),
+    }]
 }
 
 // Encodes neutral streaming events into OpenAI Responses events.
@@ -366,12 +376,28 @@ fn encode_responses_stream(
             Vec::new()
         }
         LlmResponseChunk::DecodeError { message } | LlmResponseChunk::StreamError { message } => {
-            // An in-band error is terminal: emit the error, then nothing further.
-            state.finished = true; // finish() adds no success events
-            state.errored = true; // the entry guard drops any later chunk
-            vec![json!({"type": "error", "message": message})]
+            fail_responses_stream(state, message)
         }
     }
+}
+
+// Emits the Responses terminal failure event instead of leaving strict clients waiting for
+// `response.completed`. The partial output stays in preceding delta events and is not presented
+// as a completed output item in the failed response snapshot.
+fn fail_responses_stream(state: &mut StreamTranslationState, message: String) -> Vec<Value> {
+    let mut out = ensure_responses_created(state);
+    let mut response = responses_stream_response(state, "failed", None, Vec::new());
+    response.error = Some(json!({
+        "code": "server_error",
+        "message": message,
+    }));
+    out.push(json!({
+        "type": "response.failed",
+        "response": response,
+    }));
+    state.finished = true; // finish() must not add `response.completed`
+    state.errored = true; // later source chunks cannot follow a terminal failure
+    out
 }
 
 // Emits final OpenAI Responses completion events from accumulated state.

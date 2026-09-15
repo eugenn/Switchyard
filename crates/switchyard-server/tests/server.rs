@@ -3291,6 +3291,8 @@ async fn responses_stream_error_does_not_emit_success_terminal_events() -> TestR
     assert_eq!(response.status, StatusCode::OK);
     let body = response.text()?;
     assert_in_order(body, &["before", "upstream stream failed"]);
+    assert!(body.contains("event: response.failed"), "{body}");
+    assert!(body.contains(r#""status":"failed""#), "{body}");
     for event_type in [
         "response.content_part.done",
         "response.output_item.done",
