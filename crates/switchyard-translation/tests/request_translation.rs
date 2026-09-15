@@ -1503,6 +1503,37 @@ fn responses_encrypted_reasoning_replays_without_input_content() -> TestResult {
     Ok(())
 }
 
+// A synthesized request — one a judge builds, with no client body to replay —
+// is what the upstream actually receives, and Codex's own backend takes `input`
+// only as a list. The lone user text the Responses API also accepts as a bare
+// string is therefore encoded as a one-item list.
+#[test]
+fn responses_encodes_a_lone_user_message_as_a_list() -> TestResult {
+    let engine = TranslationEngine::default();
+    let policy = TranslationPolicy {
+        preservation: switchyard_translation::PreservationPolicy::Disabled,
+        ..TranslationPolicy::default()
+    };
+    let body = json!({"model": "judge", "input": "Rename foo to bar in utils.py"});
+
+    let request = engine
+        .decode_request(WireFormat::OpenAiResponses, &body, &policy)?
+        .request;
+    let output = engine
+        .encode_request(WireFormat::OpenAiResponses, &request, &policy)?
+        .body;
+
+    let input = output["input"].as_array().ok_or("input is not a list")?;
+    assert_eq!(input.len(), 1);
+    assert_eq!(input[0]["role"], "user");
+    assert!(
+        serde_json::to_string(&input[0])?.contains("Rename foo to bar in utils.py"),
+        "the user text should survive: {}",
+        input[0]
+    );
+    Ok(())
+}
+
 // Verifies an empty non-encrypted reasoning item is omitted instead of being
 // replayed as an empty assistant message.
 #[test]
