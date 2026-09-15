@@ -870,15 +870,20 @@ async fn metrics_exposes_switchyard_otel_instruments() -> TestResult {
             "unexpected delta for {name}"
         );
     }
-    // A sub-millisecond boundary exists only because of the server's bucket view.
-    assert!(
-        metric_line(
-            metrics,
-            "switchyard_routing_overhead_ms_bucket",
-            &[("algorithm", "random"), ("le", "0.1")]
-        )
-        .is_some()
-    );
+    // Both boundaries exist only because of the server's bucket view: the sub-millisecond head
+    // measures passthrough routing, and the five-minute tail keeps a classifier-backed
+    // algorithm's overhead from saturating the top bucket.
+    for boundary in ["0.1", "300000"] {
+        assert!(
+            metric_line(
+                metrics,
+                "switchyard_routing_overhead_ms_bucket",
+                &[("algorithm", "random"), ("le", boundary)]
+            )
+            .is_some(),
+            "missing routing overhead bucket le={boundary}"
+        );
+    }
     for metric in [
         "switchyard_model_call_latency_ms_bucket",
         "switchyard_total_latency_ms_bucket",

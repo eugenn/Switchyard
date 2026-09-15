@@ -18,9 +18,13 @@ const CLIENT_DISCONNECTED_OUTCOME: &str = "client_disconnected";
 
 /// Bucket boundaries for `switchyard.routing_overhead_ms`.
 /// Need a broad range because some algos call an LLM (classifier), and some
-/// do very little (passthrough).
+/// do very little (passthrough). The sub-millisecond head keeps passthrough routing
+/// measurable; the tail matches `LLM_LATENCY_BUCKETS_MS` so a classifier-bound
+/// overhead p99 stays readable instead of saturating at the top bucket, and can be
+/// compared against model-call latency on the same boundaries.
 const ROUTING_OVERHEAD_BUCKETS_MS: &[f64] = &[
     0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0,
+    7500.0, 10_000.0, 15_000.0, 30_000.0, 60_000.0, 120_000.0, 300_000.0,
 ];
 
 /// Bucket boundaries for model-call and end-to-end LLM latency histograms.

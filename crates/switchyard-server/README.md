@@ -238,6 +238,7 @@ No duration for the request-serving call is subtracted. If routing itself produc
 that call occurred inside the measured `drive` interval. The metric carries only `algorithm`,
 since the duration describes the router rather than the target it chose; a routing failure before
 an outcome records nothing. Its buckets start at 0.1 ms via a view in the server; the SDK defaults
-start at 5 ms.
+start at 5 ms. They run out to five minutes, matching the model-call latency buckets, because a
+classifier-backed algorithm spends an LLM call inside the measured interval.
 
 See [CONFIGURATION.md](CONFIGURATION.md) to add an LLM client, target, or algorithm.
