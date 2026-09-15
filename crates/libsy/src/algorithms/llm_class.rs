@@ -149,15 +149,36 @@ fn window_start(tail: &[&Message], recent_turn_window: usize) -> usize {
 }
 
 /// Keeps the opening task and the latest user follow-up when they differ.
+///
+/// A coding agent's turn arrives with the tool traffic it has run so far, and an
+/// inbound decoder may carry a tool result as a user-role message. The newest of
+/// those is not a follow-up the judge can route: it answers a call this path
+/// never keeps, so sending it hands the classifier target a result whose id was
+/// never introduced, which upstreams reject outright — and the turn then routes
+/// with no verdict at all. Only messages carrying user-authored content are
+/// eligible, and a result travelling alongside that content is dropped with them.
 fn task_messages(messages: &[Message]) -> Vec<Message> {
-    let mut user_messages = messages.iter().filter(|message| message.role == Role::User);
+    let is_authored = |message: &&Message| {
+        message.role == Role::User
+            && message
+                .content
+                .iter()
+                .any(|block| !matches!(block, ContentBlock::ToolResult(_)))
+    };
+    let mut user_messages = messages.iter().filter(is_authored);
     let Some(opening_task) = user_messages.next() else {
         return Vec::new();
     };
-    match user_messages.next_back() {
+    let mut kept = match user_messages.next_back() {
         Some(latest_follow_up) => vec![opening_task.clone(), latest_follow_up.clone()],
         None => vec![opening_task.clone()],
+    };
+    for message in &mut kept {
+        message
+            .content
+            .retain(|block| !matches!(block, ContentBlock::ToolResult(_)));
     }
+    kept
 }
 
 /// Selects the task messages shown to capability and custom-schema classifiers.
@@ -1484,6 +1505,72 @@ mod tests {
                 tool_result("orphan"),
                 Message::text(Role::Assistant, "recent 1"),
                 Message::text(Role::User, "recent 2"),
+            ]
+        );
+    }
+
+    /// The shape an inbound decoder gives a tool result whose call it reports
+    /// separately: a user-role message whose only content answers that call.
+    fn user_tool_result(id: &str) -> Message {
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult(ToolResult {
+                tool_call_id: id.to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "tool output".to_string(),
+                }],
+                is_error: None,
+            })],
+        }
+    }
+
+    /// Every turn of a coding-agent loop ends on the result of the call it just
+    /// ran. Taken as the latest follow-up it would reach the judge without its
+    /// call, and an upstream that pairs the two rejects the whole request — so
+    /// the unwindowed view falls back to the task it can still route.
+    #[test]
+    fn the_task_view_skips_a_trailing_tool_result() {
+        let messages = vec![
+            Message::text(Role::User, "initial task"),
+            tool_call("call-1"),
+            user_tool_result("call-1"),
+        ];
+
+        assert_eq!(
+            task_messages(&messages),
+            vec![Message::text(Role::User, "initial task")]
+        );
+    }
+
+    /// A decoder that packs a result beside the text it accompanies must not
+    /// smuggle that result in with a follow-up worth keeping.
+    #[test]
+    fn the_task_view_drops_a_tool_result_beside_user_text() {
+        let messages = vec![
+            Message::text(Role::User, "initial task"),
+            tool_call("call-1"),
+            Message {
+                role: Role::User,
+                content: vec![
+                    ContentBlock::ToolResult(ToolResult {
+                        tool_call_id: "call-1".to_string(),
+                        content: vec![ContentBlock::Text {
+                            text: "tool output".to_string(),
+                        }],
+                        is_error: None,
+                    }),
+                    ContentBlock::Text {
+                        text: "and now ship it".to_string(),
+                    },
+                ],
+            },
+        ];
+
+        assert_eq!(
+            task_messages(&messages),
+            vec![
+                Message::text(Role::User, "initial task"),
+                Message::text(Role::User, "and now ship it"),
             ]
         );
     }
