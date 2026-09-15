@@ -18,11 +18,10 @@ scrape_configs:
     scheme: http
     scrape_interval: 15s
     static_configs:
-      # Replace with your Switchyard host(s) and port(s). Swap this
-      # static_configs block for kubernetes_sd_configs in a
-      # cluster-native deployment.
+      # Docker Desktop resolves this to the host. The compose file also maps
+      # it through host-gateway for Linux Docker Engine.
       - targets:
-          - switchyard.example.internal:4100
+          - host.docker.internal:4000
 
 # Reference the alert rule file shipped alongside this scrape config.
 # Adjust the path to wherever your Prometheus loads rule files from.
