@@ -893,6 +893,14 @@ async fn successful_run_records_metrics_spans_and_outcome_metadata() -> switchya
         u64_counter_value(&snapshots, "switchyard.decisions", &token_attrs),
         Some(1)
     );
+    assert_eq!(
+        u64_counter_value(
+            &snapshots,
+            "switchyard.model_selections",
+            &[("model", MODEL), ("effort", "high")],
+        ),
+        Some(1)
+    );
     let routed_attrs = [("model", MODEL)];
     assert_eq!(
         u64_counter_value(&snapshots, "switchyard.requests", &routed_attrs),
@@ -1337,15 +1345,12 @@ async fn dropped_stream_records_cancelled_outcome() -> switchyard_libsy::Result<
 #[tokio::test]
 async fn typed_client_failure_records_semantic_error_type() {
     let _guard = serialize_test().lock().await;
-    let (store, _, _, _, _) = telemetry();
+    let (store, exporter, provider, _, _) = telemetry();
     const ALGO: &str = "obs-timeout-algo";
     const MODEL: &str = "obs-timeout-model";
-    let result = run(
-        algo(ALGO, MODEL),
-        Arc::new(TimeoutClient),
-        request_with_metadata("obs-timeout-session", "obs-timeout-corr"),
-    )
-    .await;
+    let mut request = request_with_metadata("obs-timeout-session", "obs-timeout-corr");
+    request.llm_request.reasoning.effort = Some("high".to_string());
+    let result = run(algo(ALGO, MODEL), Arc::new(TimeoutClient), request).await;
     assert!(matches!(
         result,
         Err(LibsyError::ClientCall {
@@ -1353,6 +1358,16 @@ async fn typed_client_failure_records_semantic_error_type() {
             ..
         })
     ));
+
+    let snapshots = flushed_metrics(exporter, provider);
+    assert_eq!(
+        u64_counter_value(
+            &snapshots,
+            "switchyard.model_selections",
+            &[("model", MODEL), ("effort", "high")],
+        ),
+        Some(1)
+    );
 
     let spans = store.spans();
     let client_span = find_span(&spans, "libsy.client_call", "selected_model", MODEL);

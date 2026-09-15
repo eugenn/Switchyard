@@ -50,6 +50,7 @@ pub async fn run(
     observer: Option<RunObserver>,
 ) -> Result<(ModelId, Response)> {
     let algorithm_name = algorithm.name().to_string();
+    let requested_effort = request.llm_request.reasoning.effort.clone();
     let run_started = Instant::now();
     let routing_clients = clients.clone();
     // This says if we have an observer, put Some(..) in routing_observations.
@@ -71,6 +72,7 @@ pub async fn run(
     metrics::record_routing_overhead(&algorithm_name, overhead);
 
     let selected_model_id = outcome.selected_model_id()?.clone();
+    metrics::record_model_selection(&selected_model_id, requested_effort.as_deref());
     let (result, answer_duration) = if let Some(response) = outcome.response {
         (Ok(response), None)
     } else {

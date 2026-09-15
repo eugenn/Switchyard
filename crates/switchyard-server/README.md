@@ -200,6 +200,7 @@ Routed-call compatibility metrics are:
 | `switchyard_total_errors` | gauge | none | Failed final routed calls |
 | `switchyard_requests_total` | counter | `model` | Successful final routed calls |
 | `switchyard_errors_total` | counter | `model` | Failed final routed calls |
+| `switchyard_model_selections_total` | counter | `model`, `effort` | Routed endpoint selections by requested reasoning effort |
 | `switchyard_model_call_latency_ms` | histogram | `model` | Successful final routed-call latency |
 | `switchyard_llm_calls_total` | counter | `algorithm`, `selected_model`, `outcome` | Logical routing and terminal model calls |
 | `switchyard_llm_call_duration_ms` | histogram | `algorithm`, `selected_model`, `outcome` | Logical routing and terminal model-call latency |

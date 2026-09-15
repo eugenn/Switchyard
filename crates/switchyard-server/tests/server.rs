@@ -807,6 +807,7 @@ async fn metrics_exposes_switchyard_otel_instruments() -> TestResult {
         "/v1/chat/completions",
         Some(json!({
             "model": ROUTE_MODEL,
+            "reasoning_effort": "high",
             "messages": [{"role": "user", "content": "retry-once"}]
         })),
     )
@@ -821,6 +822,15 @@ async fn metrics_exposes_switchyard_otel_instruments() -> TestResult {
             metrics,
             "switchyard_router_retry_recovered_total",
             &[]
+        ),
+        Some(1.0)
+    );
+    assert_eq!(
+        metric_delta(
+            seeded,
+            metrics,
+            "switchyard_model_selections_total",
+            &[("model", MODEL), ("effort", "high")]
         ),
         Some(1.0)
     );

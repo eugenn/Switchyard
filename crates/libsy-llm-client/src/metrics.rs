@@ -139,6 +139,32 @@ pub(crate) fn record_answer_call(
         .record(duration.as_secs_f64() * 1000.0, &attributes);
 }
 
+/// Records the model selected by the routing outcome and the inbound reasoning effort.
+pub(crate) fn record_model_selection(selected_model: &ModelId, requested_effort: Option<&str>) {
+    global::meter("switchyard")
+        .u64_counter("switchyard.model_selections")
+        .build()
+        .add(
+            1,
+            &[
+                KeyValue::new("model", selected_model.to_string()),
+                KeyValue::new("effort", reasoning_effort_label(requested_effort)),
+            ],
+        );
+}
+
+// Preserve bounded Prometheus cardinality when an upstream accepts custom effort strings.
+fn reasoning_effort_label(requested_effort: Option<&str>) -> &'static str {
+    match requested_effort {
+        None => "unset",
+        Some("low") => "low",
+        Some("medium") => "medium",
+        Some("high") => "high",
+        Some("xhigh") => "xhigh",
+        Some(_) => "other",
+    }
+}
+
 /// Records one terminal routed request after the algorithm has produced an outcome.
 pub(crate) fn record_routed_request(
     selected_model: &ModelId,
@@ -184,5 +210,15 @@ mod tests {
             assert_eq!(http_outcome_label(Some(status)), "other_error");
         }
         assert_eq!(http_outcome_label(None), "retryable_error");
+    }
+
+    #[test]
+    fn reasoning_effort_label_is_bounded() {
+        assert_eq!(reasoning_effort_label(None), "unset");
+        assert_eq!(reasoning_effort_label(Some("low")), "low");
+        assert_eq!(reasoning_effort_label(Some("medium")), "medium");
+        assert_eq!(reasoning_effort_label(Some("high")), "high");
+        assert_eq!(reasoning_effort_label(Some("xhigh")), "xhigh");
+        assert_eq!(reasoning_effort_label(Some("provider-specific")), "other");
     }
 }

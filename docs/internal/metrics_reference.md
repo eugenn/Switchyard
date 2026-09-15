@@ -42,6 +42,7 @@ tier for the selected model, such as `strong` or `weak` for a two-tier classifie
 | `switchyard_cached_tokens_total{model}` | counter | Cached prompt tokens per endpoint. |
 | `switchyard_cache_creation_tokens_total{model}` | counter | Cache-creation tokens per endpoint. |
 | `switchyard_reasoning_tokens_total{model}` | counter | Reasoning tokens per endpoint. |
+| `switchyard_model_selections_total{model,effort}` | counter | Routed endpoint selections by requested reasoning effort. |
 
 ## Per-endpoint latency histograms
 
@@ -52,6 +53,15 @@ Each histogram emits `_bucket`, `_sum`, and `_count` series. Use
 |---|---|---|
 | `switchyard_model_call_latency_ms{model}` | histogram | Successful final routed-call latency. |
 | `switchyard_total_latency_ms{model}` | histogram | End-to-end latency for successful routed responses. For streaming responses this is full-turn time, **not** time-to-first-token. |
+
+## Model selections by reasoning effort
+
+`switchyard_model_selections_total` increments once when routing selects the
+primary endpoint, before the terminal model call. A failed terminal call still
+retains its routing attribution. Its `effort` label is the normalized request
+value, not a provider-reported setting: `low`, `medium`, `high`, and `xhigh` are
+retained; an omitted effort is `unset`; any other upstream-specific value is
+`other`.
 
 ## Routing overhead (global, no model label)
 
@@ -129,6 +139,10 @@ error_rate_reduction = direct_error_rate − router_error_rate
 sum by (model) (rate(switchyard_requests_total[5m]))
   / ignoring(model) group_left sum(rate(switchyard_requests_total[5m]))
 
+# Model and requested-effort share for router-selection visualizations
+sum by (model, effort) (rate(switchyard_model_selections_total[5m]))
+  / ignoring(model, effort) group_left sum(rate(switchyard_model_selections_total[5m]))
+
 # Error-code distribution over time (stack the series in a Grafana time-series panel)
 sum by (code) (rate(switchyard_upstream_attempts_total{code!="200"}[5m]))
 
@@ -154,6 +168,7 @@ into label space.
 | Label | Values | Where |
 |---|---|---|
 | `model` | One per configured endpoint, typically 2–6 per deployment. | All per-endpoint metrics. |
+| `effort` | `low`, `medium`, `high`, `xhigh`, `unset`, or `other`. | `switchyard_model_selections_total` |
 | `outcome` | `ok`, `retryable_error`, `other_error`; plus `client_disconnected` on `switchyard_client_responses_total`. | Outcome counters |
 | `code` | Bounded: the known-code allowlist (`200`, `400`, `401`, `403`, `404`, `408`, `409`, `422`, `429`, `500`, `502`, `503`, `504`), plus `none` and the per-class buckets `1xx`/`2xx`/`3xx`/`4xx`/`5xx`/`other`. About 20 values max. | `switchyard_upstream_attempts_total` |
 | `le` | The configured histogram bucket boundaries. | Histogram buckets |
