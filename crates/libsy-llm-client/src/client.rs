@@ -12,13 +12,13 @@ use futures_util::{StreamExt, stream};
 use http::StatusCode;
 use reqwest::RequestBuilder;
 use reqwest::header::{CONTENT_TYPE, HeaderMap, RETRY_AFTER};
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 use switchyard_protocol::{
-    LlmRequest, LlmResponse, LlmResponseChunk, LlmResponseStreamEvent, Metadata, ModelId, Request,
-    Response, RoutedLlmClient,
+    LlmRequest, LlmResponse, LlmResponseChunk, LlmResponseStream, LlmResponseStreamEvent, Metadata,
+    ModelId, Request, Response, RoutedLlmClient,
 };
 use switchyard_translation::{
-    WireFormat, decode_aggregated_response, decode_request, decode_stream,
+    TranslationError, WireFormat, decode_aggregated_response, decode_request, decode_stream,
     encode_aggregated_response_with_extensions, encode_request, encode_stream_with_extensions,
 };
 use tracing::Instrument;
@@ -223,7 +223,7 @@ impl TranslatingLlmClient {
     /// forwarded headers plus the backend's static headers and auth, and return the
     /// successful upstream response. A
     /// buffered response is fully collected within the retry boundary; a streamed
-    /// response is returned as soon as its successful headers arrive. A non-success
+    /// response has its first decoded event checked within that boundary. A non-success
     /// status maps to a typed error — a 400 is classified as a context-window
     /// overflow via the backend's provider rules. Shared by
     /// [`call_rewrite_model`](Self::call_rewrite_model) (which POSTs to the
@@ -359,10 +359,23 @@ impl TranslatingLlmClient {
         if status.is_success() {
             let response_is_event_stream = is_event_stream(response.headers());
             if streaming || response_is_event_stream {
-                // Streaming body failures happen after the retry boundary.
+                let upstream_headers = response.headers().clone();
+                let chunks = match prepare_response_stream(response, backend, model).await {
+                    Ok(chunks) => chunks,
+                    Err(error) => {
+                        metrics::record_upstream_attempt(None);
+                        return Err(AttemptFailure {
+                            error,
+                            status: Some(status),
+                            retry_after: None,
+                        });
+                    }
+                };
                 metrics::record_upstream_attempt(Some(status.as_u16()));
                 return Ok(EncodedResponse::Streaming {
-                    response,
+                    status: status.as_u16(),
+                    chunks,
+                    upstream_headers,
                     // Some proxies stream every upstream response even when the request
                     // explicitly asks for a buffered one. Preserve the caller's contract.
                     aggregate: !streaming,
@@ -473,40 +486,12 @@ impl TranslatingLlmClient {
 
         let (llm_response, upstream_headers) = match http_response {
             EncodedResponse::Streaming {
-                response: http_response,
+                chunks,
+                upstream_headers,
                 aggregate,
+                ..
             } => {
-                // Adapt the reqwest body stream to plain bytes; the SSE-decode itself is
-                // transport-agnostic and lives in `switchyard-translation`.
-                let upstream_headers = http_response.headers().clone();
-                let bytes = http_response.bytes_stream().map(|chunk| {
-                    chunk
-                        .map(|bytes| bytes.to_vec())
-                        .map_err(convert_reqwest_error)
-                });
-                let mut chunks = decode_stream(bytes, wire_format)?;
-                // Providers reject an over-ceiling streaming request with an in-band error
-                // event on an HTTP 200, and send it after the events that open the stream.
-                // Classify every opening event before returning the stream: nothing has
-                // reached the caller yet, so an overflow can still fail the call and let
-                // routing try the next candidate.
-                let mut opening = Vec::new();
-                let response = loop {
-                    let Some(event) = chunks.next().await else {
-                        break LlmResponse::Stream(stream::iter(opening).boxed());
-                    };
-                    if let Some(message) = event_overflow(&event, backend) {
-                        return Err(LlmClientError::ContextWindowExceeded {
-                            model: model_id.clone(),
-                            message,
-                        });
-                    }
-                    let opens_the_response = opens_the_response(&event);
-                    opening.push(event);
-                    if !opens_the_response {
-                        break LlmResponse::Stream(stream::iter(opening).chain(chunks).boxed());
-                    }
-                };
+                let response = LlmResponse::Stream(chunks);
                 let llm_response = if aggregate {
                     LlmResponse::Agg(response.into_agg().await?)
                 } else {
@@ -522,8 +507,24 @@ impl TranslatingLlmClient {
                 let body = serde_json::from_slice::<Value>(&body).map_err(|error| {
                     LlmClientError::ResponseTranslation(format!("invalid upstream JSON: {error}"))
                 })?;
-                let agg = decode_aggregated_response(&body, wire_format)
-                    .map_err(|error| LlmClientError::ResponseTranslation(error.to_string()))?;
+                // Map a provider's failed generation to 502, even under HTTP 200.
+                // Redact forwarded credentials before returning the provider error.
+                let agg =
+                    decode_aggregated_response(&body, wire_format).map_err(
+                        |error| match error {
+                            TranslationError::UpstreamFailure { error } => {
+                                LlmClientError::UpstreamHttp {
+                                    status: StatusCode::BAD_GATEWAY,
+                                    body: redact_forwarded_headers(
+                                        json!({ "error": error }).to_string(),
+                                        metadata.as_ref(),
+                                        backend.is_forwarding_auth(),
+                                    ),
+                                }
+                            }
+                            error => LlmClientError::ResponseTranslation(error.to_string()),
+                        },
+                    )?;
                 (LlmResponse::Agg(agg), upstream_headers)
             }
         };
@@ -641,7 +642,9 @@ enum EncodedResponse {
         upstream_headers: HeaderMap,
     },
     Streaming {
-        response: reqwest::Response,
+        status: u16,
+        chunks: LlmResponseStream,
+        upstream_headers: HeaderMap,
         aggregate: bool,
     },
 }
@@ -649,8 +652,8 @@ enum EncodedResponse {
 impl EncodedResponse {
     fn status(&self) -> u16 {
         match self {
-            EncodedResponse::Buffered { status, .. } => *status,
-            EncodedResponse::Streaming { response, .. } => response.status().as_u16(),
+            EncodedResponse::Buffered { status, .. }
+            | EncodedResponse::Streaming { status, .. } => *status,
         }
     }
 }
@@ -679,6 +682,45 @@ impl AttemptFailure {
                 metrics::is_retryable_http_status(status.as_u16())
             }
             _ => false,
+        }
+    }
+}
+
+async fn prepare_response_stream(
+    response: reqwest::Response,
+    backend: &Backend,
+    model: &ModelId,
+) -> Result<LlmResponseStream> {
+    let bytes = response.bytes_stream().map(|chunk| {
+        chunk
+            .map(|bytes| bytes.to_vec())
+            .map_err(convert_reqwest_error)
+    });
+    let mut chunks = decode_stream(bytes, backend.wire_format())?;
+    // Providers can reject a request after sending the events that open the stream.
+    // Check those events before returning any part of the response to the caller.
+    let mut opening = Vec::new();
+    loop {
+        let event = match chunks.next().await {
+            None => return Ok(stream::iter(opening).boxed()),
+            // Transport failures before the first event can still be retried.
+            Some(Err(
+                error @ (LlmClientError::Transport { .. } | LlmClientError::Timeout { .. }),
+            )) if opening.is_empty() => {
+                return Err(error);
+            }
+            Some(event) => event,
+        };
+        if let Some(message) = event_overflow(&event, backend) {
+            return Err(LlmClientError::ContextWindowExceeded {
+                model: model.clone(),
+                message,
+            });
+        }
+        let opens_the_response = opens_the_response(&event);
+        opening.push(event);
+        if !opens_the_response {
+            return Ok(stream::iter(opening).chain(chunks).boxed());
         }
     }
 }
@@ -1660,6 +1702,40 @@ mod tests {
                 completion_text(&response.llm_response.into_agg().await?),
                 "recovered"
             );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pre_first_event_transport_failure_uses_retry_budget()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let truncated = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                         Content-Length: 100\r\nConnection: close\r\n\r\n";
+        let body = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"recovered\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+        let success = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+
+        for second in [success, truncated.to_string()] {
+            let is_exhausted = second == truncated;
+            let (base_url, server) = response_sequence_server(vec![truncated.to_string(), second])?;
+            let client = TranslatingLlmClient::new(&chat_map_with_retries(&base_url, 1))?;
+            let result = client
+                .call_rewrite_model(request_for(Some("gpt"), true), None)
+                .await;
+            if is_exhausted {
+                assert!(matches!(result, Err(LlmClientError::Transport { .. })));
+            } else {
+                assert_eq!(
+                    completion_text(&result?.llm_response.into_agg().await?),
+                    "recovered"
+                );
+            }
+            server
+                .join()
+                .map_err(|_| std::io::Error::other("response server thread panicked"))??;
         }
         Ok(())
     }
