@@ -3,6 +3,7 @@
 
 //! Per-provider backend configuration: wire format, upstream URL, and auth.
 
+use std::time::Duration;
 use std::{collections::BTreeMap, fmt};
 
 use reqwest::RequestBuilder;
@@ -62,6 +63,9 @@ pub struct HttpBackendConfig {
     pub reasoning_effort: Option<String>,
     /// Additional attempts after the initial upstream request.
     pub max_retries: u32,
+    /// Deadline for one complete response, including retries, retry delays, and stream reads.
+    /// `None` leaves the wait unbounded.
+    pub timeout: Option<Duration>,
 }
 
 impl fmt::Debug for HttpBackendConfig {
@@ -74,6 +78,7 @@ impl fmt::Debug for HttpBackendConfig {
             .field("extra_body_keys", &self.extra_body.keys())
             .field("reasoning_effort", &self.reasoning_effort)
             .field("max_retries", &self.max_retries)
+            .field("timeout", &self.timeout)
             .finish()
     }
 }
@@ -143,12 +148,16 @@ impl Backend {
     /// Tolerates base URLs that already include the provider path (or a bare
     /// `/v1`), matching the join rules of the existing native backends.
     pub fn url(&self) -> String {
-        let base_url = self.config().base_url.trim_end_matches('/');
-        match self {
+        let base_url = &self.config().base_url;
+        let result = match self {
             Backend::OpenAiChat(_) => openai_url(base_url, "/chat/completions"),
             Backend::OpenAiResponses(_) => openai_url(base_url, "/responses"),
-            Backend::Anthropic(_) => anthropic_url(base_url),
-        }
+            Backend::Anthropic(_) => anthropic_url(base_url, ""),
+        };
+        result.unwrap_or_else(|error| {
+            tracing::error!(%error, "Unable to build provider endpoint URL");
+            base_url.clone()
+        })
     }
 
     /// Applies this backend's configured auth and version headers to a request builder.
@@ -256,6 +265,11 @@ impl Backend {
         self.config().max_retries
     }
 
+    /// Deadline for all attempts and the complete response; `None` leaves the wait unbounded.
+    pub fn timeout(&self) -> Option<Duration> {
+        self.config().timeout
+    }
+
     /// Whether this backend speaks the Anthropic Messages wire format — the only
     /// one with a `count_tokens` endpoint.
     pub fn is_anthropic(&self) -> bool {
@@ -265,8 +279,11 @@ impl Backend {
     /// The upstream `/v1/messages/count_tokens` URL, derived from the same base
     /// URL join as [`url`](Self::url).
     pub fn count_tokens_url(&self) -> String {
-        let base_url = self.config().base_url.trim_end_matches('/');
-        format!("{}/count_tokens", anthropic_url(base_url))
+        let base_url = &self.config().base_url;
+        anthropic_url(base_url, "/count_tokens").unwrap_or_else(|error| {
+            tracing::error!(%error, "Unable to build Anthropic token-counting URL");
+            base_url.clone()
+        })
     }
 
     /// Whether an upstream 400 `body` looks like a context-window overflow for
@@ -316,23 +333,34 @@ fn oauth_beta_header(value: &HeaderValue) -> Option<HeaderValue> {
 }
 
 // Accept either a root `/v1` URL or an already-specific OpenAI endpoint URL.
-fn openai_url(base_url: &str, suffix: &str) -> String {
-    let base_root = base_url
+pub(crate) fn openai_url(base_url: &str, suffix: &str) -> Result<String> {
+    let mut url = reqwest::Url::parse(base_url).map_err(|error| LlmClientError::Configuration {
+        message: format!("Invalid OpenAI base URL: {error}"),
+    })?;
+    let base_path = url.path().trim_end_matches('/');
+    let base_root = base_path
         .strip_suffix("/chat/completions")
-        .or_else(|| base_url.strip_suffix("/responses"))
-        .unwrap_or(base_url);
-    format!("{base_root}{suffix}")
+        .or_else(|| base_path.strip_suffix("/responses"))
+        .unwrap_or(base_path);
+    url.set_path(&format!("{base_root}{suffix}"));
+    Ok(url.into())
 }
 
 // Accept a bare host, a `/v1` root, or an already-specific `/v1/messages` URL.
-fn anthropic_url(base_url: &str) -> String {
-    if base_url.ends_with("/v1/messages") {
-        base_url.to_string()
-    } else if base_url.ends_with("/v1") {
-        format!("{base_url}/messages")
+fn anthropic_url(base_url: &str, suffix: &str) -> Result<String> {
+    let mut url = reqwest::Url::parse(base_url).map_err(|error| LlmClientError::Configuration {
+        message: format!("Invalid Anthropic base URL: {error}"),
+    })?;
+    let base_path = url.path().trim_end_matches('/');
+    let messages_path = if base_path.ends_with("/v1/messages") {
+        base_path.to_string()
+    } else if base_path.ends_with("/v1") {
+        format!("{base_path}/messages")
     } else {
-        format!("{base_url}/v1/messages")
-    }
+        format!("{base_path}/v1/messages")
+    };
+    url.set_path(&format!("{messages_path}{suffix}"));
+    Ok(url.into())
 }
 
 #[cfg(test)]
@@ -348,6 +376,7 @@ mod tests {
             extra_body: BTreeMap::new(),
             reasoning_effort: None,
             max_retries: 0,
+            timeout: None,
         }
     }
 
@@ -426,7 +455,7 @@ mod tests {
         assert!(backend.is_context_overflow(
             r#"{"error":{"message":"Input length 877338 exceeds the maximum allowed input length of 639968 tokens","code":"400"}}"#
         ));
-        // Native SGLang: top-level envelope (no `error` key), caught by the raw-body phrase match.
+        // Native SGLang: top-level error envelope (no `error` key).
         // KV-pool rejection (managers/utils.py) and declared-context rejection
         // (tokenizer_manager.py); both stable across v0.5.15-v0.5.17.
         assert!(backend.is_context_overflow(

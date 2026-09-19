@@ -158,27 +158,35 @@ fn window_start(tail: &[&Message], recent_turn_window: usize) -> usize {
 /// with no verdict at all. Only messages carrying user-authored content are
 /// eligible, and a result travelling alongside that content is dropped with them.
 fn task_messages(messages: &[Message]) -> Vec<Message> {
-    let is_authored = |message: &&Message| {
-        message.role == Role::User
-            && message
-                .content
-                .iter()
-                .any(|block| !matches!(block, ContentBlock::ToolResult(_)))
+    // Decoders also use the user role for tool results. Select ordinary user content
+    // first, so a tool result cannot replace the opening task or latest follow-up.
+    let is_task_content = |block: &ContentBlock| {
+        !matches!(
+            block,
+            ContentBlock::ToolCall(_)
+                | ContentBlock::ToolResult(_)
+                | ContentBlock::Reasoning { .. }
+        )
     };
-    let mut user_messages = messages.iter().filter(is_authored);
+    let mut user_messages = messages.iter().filter(|message| {
+        message.role == Role::User && message.content.iter().any(is_task_content)
+    });
     let Some(opening_task) = user_messages.next() else {
         return Vec::new();
     };
-    let mut kept = match user_messages.next_back() {
-        Some(latest_follow_up) => vec![opening_task.clone(), latest_follow_up.clone()],
-        None => vec![opening_task.clone()],
-    };
-    for message in &mut kept {
-        message
-            .content
-            .retain(|block| !matches!(block, ContentBlock::ToolResult(_)));
-    }
-    kept
+    [Some(opening_task), user_messages.next_back()]
+        .into_iter()
+        .flatten()
+        .map(|message| Message {
+            role: Role::User,
+            content: message
+                .content
+                .iter()
+                .filter(|block| is_task_content(block))
+                .cloned()
+                .collect(),
+        })
+        .collect()
 }
 
 /// Selects the task messages shown to capability and custom-schema classifiers.
@@ -1417,6 +1425,41 @@ mod tests {
                 is_error: None,
             })],
         }
+    }
+
+    #[test]
+    fn default_task_input_keeps_user_content_around_tool_results() {
+        let mut result = tool_result("call-1");
+        result.role = Role::User;
+        let mut mixed = result.clone();
+        mixed.content.push(ContentBlock::Text {
+            text: "latest follow-up".to_string(),
+        });
+        let input = TaskInput {
+            recent_turn_window: None,
+        };
+        let mut request = Request {
+            llm_request: LlmRequest {
+                messages: vec![
+                    result.clone(),
+                    Message::text(Role::User, "initial task"),
+                    tool_call("call-1"),
+                    mixed,
+                    result.clone(),
+                ],
+                ..LlmRequest::default()
+            },
+            ..Request::default()
+        };
+        assert_eq!(
+            input.build_messages(&State::default(), &request),
+            vec![
+                Message::text(Role::User, "initial task"),
+                Message::text(Role::User, "latest follow-up"),
+            ]
+        );
+        request.llm_request.messages = vec![result];
+        assert!(input.build_messages(&State::default(), &request).is_empty());
     }
 
     /// A count-based window can begin on a tool result, which leaves the call that

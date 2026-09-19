@@ -54,9 +54,22 @@ route reaches no upstream. A file without a `[targets]` table is rejected with
 | `forward_auth` | No | `false` | Forward the caller's provider credential and application headers. All backends reachable through the route must use the same provider. |
 | `extra_headers` | No | `{}` | Custom HTTP headers sent to the model server. Set credentials with `api_key_env` or `forward_auth`; the server rejects headers owned by the selected auth mode. Header names are case-insensitive. |
 | `max_retries` | No | `2` | Retry budget, `0`–`10`. |
+| `timeout_ms` | No | unset | Deadline in milliseconds for all attempts, retry delays, and the complete response, including stream reads. Must be at least `1`. Unset leaves the wait unbounded. |
 
 The TOML never contains the secret itself. `api_key_env` names a variable that
 must exist and be non-empty when the server loads.
+
+`timeout_ms` applies separately to every call through the client, including judge
+verdicts and answers. To give a judge a short deadline without limiting the
+answering models, put the judge on its own `[llm_clients]` entry; two entries may
+share a `base_url`. When the deadline expires, the server returns `504` without
+trying another target. If the final answer has already started streaming, the
+server sends a framed error and ends the stream without a success marker.
+
+The Rust runner collects streams used during routing before the algorithm
+continues, preserving provider events for replay. After the configured retries,
+an HTTP client failure stops routing. This also applies when `timeout_ms` is
+unset or an advisor has `fail_open = true`.
 
 Set `forward_auth = true` to use each caller's credential instead of a
 server-owned key:
@@ -92,7 +105,12 @@ endpoint, before it calls an upstream.
 | `llm_client` | Yes | — | Key under `[llm_clients]`. |
 | `system_prompt` | No | unset | System prompt prepended when this target serves a completion. |
 | `extra_body` | No | `{}` | Values merged into the upstream request when the request does not already set that key. |
-| `reasoning_effort` | No | unset | Reasoning effort forced on every request to this target, replacing the value the caller sent (`reasoning.effort` on `openai_responses`, `reasoning_effort` on `openai_chat`). Rejected on `anthropic_messages` clients. Use it to run one target at a different effort than the client asked for, for example a strong tier at `max` behind a client that sends `high`. Two targets for the same model id on the same `llm_client` collapse into one, so give each effort tier its own `llm_clients` entry (same endpoint, different name). |
+| `reasoning_effort` | No | unset | Reasoning effort forced on every request to this target, replacing the value the caller sent (`reasoning.effort` on `openai_responses`, `reasoning_effort` on `openai_chat`). Rejected on `anthropic_messages` clients. Use it to run one target at a different effort than the client asked for, for example a strong tier at `max` behind a client that sends `high`. Targets with different effort settings need distinct model IDs when used within one route. Separate routes may use the same model ID with separate `llm_clients` entries (same endpoint, different name). |
+
+Within one route, callable targets with the same model ID must use the same `llm_client`.
+This includes completion targets and targets used for judging or classification. Switchyard rejects
+same-model targets on different clients within a route because execution is keyed by model ID.
+Separate routes may use the same model ID on different clients.
 
 Each selected or fallback target is prepared from the routed request independently. A prompt
 configured for one target is therefore not carried into another target's fallback request.
@@ -114,9 +132,9 @@ Every route takes the common keys below, plus the keys for its type.
 | `id` | Yes | — | Public model ID that callers send in requests. |
 | `type` | Yes | — | Routing algorithm for this route. |
 | `context_window` | No | unset | Positive token count advertised for this route by `GET /v1/models`. Unset values appear as `null`. This does not enforce a request limit. |
-| `tool_calling` | No | unset | Whether `GET /v1/models` advertises tool-calling support for this route. Unset values appear as `null`. |
-| `reasoning` | No | unset | Declared reasoning support, stored in route metadata. The server does not include it in `GET /v1/models`. |
-| `vision` | No | unset | Image-input support advertised in `GET /v1/models` under `data[].capabilities.vision`. Unset values appear as `null`. Declare `true` only when every target the route can select accepts images. |
+| `tool_calling` | No | unset | Tool-calling support advertised by `GET /v1/models`. When `false`, the server rejects tool definitions, tool controls, and tool history with HTTP 400 before dispatch. Unset values appear as `null`. Explicit `true` and unset values do not restrict requests. |
+| `reasoning` | No | unset | When `false`, the server rejects reasoning controls with HTTP 400 before dispatch. Explicit `true` and unset values do not restrict requests. The server does not include this declaration in `GET /v1/models`. |
+| `vision` | No | unset | Image-input support advertised in `GET /v1/models` under `data[].capabilities.vision`. When `false`, the server rejects images with HTTP 400 before dispatch, including images in tool results. Unset values appear as `null`. Explicit `true` and unset values do not restrict requests. Declare `true` only when every target the route can select accepts images. |
 
 ### `noop`
 
@@ -158,6 +176,14 @@ Splits traffic across targets. See
 | `seed` | No | unset | Reproduces the selection sequence. |
 
 ### `prefill_router`
+
+!!! warning "Experimental in v0.3.0"
+
+    Switchyard v0.3.0 does not provide or support a router checkpoint, an
+    exporter, or compatible encoder assets. You must obtain or train a compatible
+    checkpoint and obtain its encoder and tokenizer yourself. There is no
+    supported end-to-end checkpoint export and compatibility contract.
+    The example below shows configuration syntax, not a ready-to-run deployment.
 
 Routes the latest non-empty user message with a checkpoint-backed prefill classifier. Build
 `switchyard-server` with `--features prefill-router` and make the prefill router's Python
@@ -222,8 +248,9 @@ Existing configurations that contain `escalation` but omit `mode` remain valid.
 
 Custom mode validates the judge's JSON against `response_schema`, resolves the
 policy selector, and routes to a runtime model group. A verdict names a group and
-the first model in it serves the turn; if that call fails the client falls through
-the rest of that group, then through whatever `models.any` adds.
+the first model in it serves the turn. An eligible non-timeout failure tries the
+rest of that group, then any remaining models in `models.any`. A timeout stops
+the request without trying another model.
 
 The `[routes.<name>.models]` table takes any group name you choose. `any` and
 `judge` are reserved and required; `capable` and `efficient` are reserved for the
@@ -232,12 +259,12 @@ how one route chooses between more than two models.
 
 | Key | Required | Default | Meaning |
 |---|:---:|---|---|
-| `models.any` | Yes | — | Every selectable completion target, in last-resort fallback order. Every other group's targets must also appear here; one that does not is rejected at configuration load. |
-| `models.judge` | Yes | — | One or more ordered judge candidates. Not a completion destination. |
-| `models.capable` | No | — | Ordered capable-tier models. A `capable` verdict selects the first and falls through the rest in order. |
-| `models.efficient` | No | — | Ordered efficient-tier models. An `efficient` verdict selects the first and falls through the rest in order. |
-| `models.<your name>` | No | — | A group you name. A verdict naming it selects its first model and falls through the rest in order. |
-| `default_target` | Yes | — | Group used when the judge fails or its verdict cannot be routed. Any group except `judge`, and it must contain at least one target. |
+| `models.any` | Yes | — | Every selectable completion target, in fallback order for eligible non-timeout failures. Every other group's targets must also appear here; one that does not is rejected at configuration load. |
+| `models.judge` | Yes | — | One or more ordered judge candidates. The Rust runner calls the first and stops on a client error after retries. Not a completion destination. |
+| `models.capable` | No | — | Ordered capable-tier models. A `capable` verdict selects the first; eligible non-timeout failures try the rest in order. |
+| `models.efficient` | No | — | Ordered efficient-tier models. An `efficient` verdict selects the first; eligible non-timeout failures try the rest in order. |
+| `models.<your name>` | No | — | A group you name. A verdict naming it selects its first model; eligible non-timeout failures try the rest in order. |
+| `default_target` | Yes | — | Group used when the judge's verdict cannot be parsed or routed. HTTP client failures stop the request after retries. Any group except `judge`, and it must contain at least one target. |
 | `prompt` | Yes | — | Judge system prompt. The configured inner schema is sent separately as structured-output configuration. |
 | `response_schema` | Yes | — | Inner JSON Schema encoded as a TOML string. Switchyard adds the provider wrapper. |
 | `policy` | Yes | — | Policy table. `target_selector` accepts a JSON Pointer such as `/decision/target`. |
@@ -315,9 +342,10 @@ configuration. Today a classifier sets the tier a stage router falls open to whe
 
 The tier is retained per session. A deployment that sends no session ID needs
 `classifier.message_hash_fallback = true`, which keys on the first user message
-instead. The stage table takes no `picker`: the classifier supplies that tier per turn. A turn the
-classifier cannot reach falls open to the efficient tier. Leaving out
-`classifier` is recommended: that judge runs ahead of the fall-open tier.
+instead. The outer `[routes.<name>.classifier]` table is required. The nested
+`[routes.<name>.stage]` table accepts neither `picker` nor a second `classifier`.
+The outer classifier supplies the default tier. A turn the classifier cannot
+reach falls open to the efficient tier.
 
 ### `advisor`
 

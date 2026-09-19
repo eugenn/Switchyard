@@ -23,7 +23,7 @@ use switchyard_translation::{
 };
 use tracing::Instrument;
 
-use crate::backend::Backend;
+use crate::backend::{Backend, openai_url};
 use crate::error::{LlmClientError, Result};
 use crate::metrics;
 use crate::raw::RawResponse;
@@ -100,11 +100,16 @@ impl AuxiliaryOperation {
     }
 
     fn url(self, backend: &Backend) -> String {
-        match self {
-            Self::AnthropicCountTokens => backend.count_tokens_url(),
-            Self::ResponsesInputTokens => format!("{}/input_tokens", backend.url()),
-            Self::ResponsesCompact => format!("{}/compact", backend.url()),
-        }
+        let suffix = match self {
+            Self::AnthropicCountTokens => return backend.count_tokens_url(),
+            Self::ResponsesInputTokens => "/responses/input_tokens",
+            Self::ResponsesCompact => "/responses/compact",
+        };
+        let base_url = backend.url();
+        openai_url(&base_url, suffix).unwrap_or_else(|error| {
+            tracing::error!(%error, "Unable to build OpenAI auxiliary endpoint URL");
+            base_url
+        })
     }
 }
 
@@ -223,8 +228,9 @@ impl TranslatingLlmClient {
     /// forwarded headers plus the backend's static headers and auth, and return the
     /// successful upstream response. A
     /// buffered response is fully collected within the retry boundary; a streamed
-    /// response has its first decoded event checked within that boundary. A non-success
-    /// status maps to a typed error — a 400 is classified as a context-window
+    /// response has its first decoded event checked within that boundary. The backend's
+    /// deadline, when set, spans every attempt, retry delay, and subsequent stream read. A
+    /// non-success status maps to a typed error — a 400 is classified as a context-window
     /// overflow via the backend's provider rules. Shared by
     /// [`call_rewrite_model`](Self::call_rewrite_model) (which POSTs to the
     /// backend's completion URL and decodes a response) and
@@ -268,15 +274,47 @@ impl TranslatingLlmClient {
         let url = endpoint.url(backend);
         record_gen_ai_request(&url, model, streaming);
 
+        self.send_with_retries(&url, backend, &body, metadata, model, streaming)
+            .await
+    }
+
+    // Sends the encoded body, retrying retryable failures within the backend's retry budget.
+    async fn send_with_retries(
+        &self,
+        url: &str,
+        backend: &Backend,
+        body: &Value,
+        metadata: Option<&Metadata>,
+        model: &ModelId,
+        streaming: bool,
+    ) -> Result<EncodedResponse> {
         let max_retries = u64::from(backend.max_retries());
         let max_attempts = max_retries + 1;
+        let expires_at = backend
+            .timeout()
+            .map(|timeout| (tokio::time::sleep(timeout).deadline(), timeout));
+        let deadline = async {
+            match expires_at {
+                Some((at, timeout)) => {
+                    tokio::time::sleep_until(at).await;
+                    timeout
+                }
+                None => std::future::pending().await,
+            }
+        };
+        tokio::pin!(deadline);
         let mut attempt = 0_u64;
         loop {
+            if let Some((at, timeout)) = expires_at
+                && tokio::time::Instant::now() >= at
+            {
+                return Err(deadline_error(timeout));
+            }
             let span = tracing::debug_span!(
                 target: "libsy",
                 "libsy.upstream_attempt",
                 model = %model,
-                wire_format = %wire_format,
+                wire_format = %backend.wire_format(),
                 attempt = attempt + 1,
                 max_attempts,
                 retry = attempt > 0,
@@ -286,10 +324,22 @@ impl TranslatingLlmClient {
                 will_retry = tracing::field::Empty,
                 retry_delay_ms = tracing::field::Empty,
             );
-            let result = self
-                .send_once(&url, backend, &body, metadata, model, streaming)
-                .instrument(span.clone())
-                .await;
+            let mut attempt_started = false;
+            let result = tokio::select! {
+                biased;
+                timeout = &mut deadline => {
+                    if attempt_started {
+                        metrics::record_upstream_attempt(None);
+                    }
+                    span.record("outcome", "error");
+                    span.record("will_retry", false);
+                    return Err(deadline_error(timeout));
+                }
+                result = async {
+                    attempt_started = true;
+                    self.send_once(url, backend, body, metadata, model, streaming).await
+                }.instrument(span.clone()) => result,
+            };
             // The retained handle updates this same attempt span with its outcome.
             match result {
                 Ok(response) => {
@@ -299,7 +349,20 @@ impl TranslatingLlmClient {
                     if attempt > 0 {
                         metrics::record_retry_recovered();
                     }
-                    return Ok(response);
+                    return Ok(match response {
+                        EncodedResponse::Streaming {
+                            status,
+                            chunks,
+                            upstream_headers,
+                            aggregate,
+                        } => EncodedResponse::Streaming {
+                            status,
+                            chunks: stream_with_deadline(chunks, expires_at),
+                            upstream_headers,
+                            aggregate,
+                        },
+                        buffered => buffered,
+                    });
                 }
                 Err(failure) => {
                     let will_retry = attempt < max_retries && failure.is_retryable();
@@ -316,7 +379,11 @@ impl TranslatingLlmClient {
                     span.record("retry_delay_ms", duration_millis(delay));
                     // Close the attempt span before sleeping so backoff is not attempt latency.
                     drop(span);
-                    tokio::time::sleep(delay).await;
+                    tokio::select! {
+                        biased;
+                        timeout = &mut deadline => return Err(deadline_error(timeout)),
+                        _ = tokio::time::sleep(delay) => {}
+                    }
                     attempt += 1;
                 }
             }
@@ -674,6 +741,18 @@ struct AttemptFailure {
     retry_after: Option<Duration>,
 }
 
+fn deadline_error(timeout: Duration) -> LlmClientError {
+    LlmClientError::Timeout {
+        source: Box::new(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!(
+                "response did not finish within {} ms, retries included",
+                duration_millis(timeout)
+            ),
+        )),
+    }
+}
+
 impl AttemptFailure {
     fn is_retryable(&self) -> bool {
         match &self.error {
@@ -684,6 +763,26 @@ impl AttemptFailure {
             _ => false,
         }
     }
+}
+
+fn stream_with_deadline(
+    chunks: LlmResponseStream,
+    deadline: Option<(tokio::time::Instant, Duration)>,
+) -> LlmResponseStream {
+    let Some((at, timeout)) = deadline else {
+        return chunks;
+    };
+    stream::unfold(Some(chunks), move |chunks| async move {
+        let mut chunks = chunks?;
+        let chunk = tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(at) => return Some((Err(deadline_error(timeout)), None)),
+            chunk = chunks.next() => chunk?,
+        };
+        let next = chunk.is_ok().then_some(chunks);
+        Some((chunk, next))
+    })
+    .boxed()
 }
 
 async fn prepare_response_stream(
@@ -1106,6 +1205,10 @@ fn count_cache_control_blocks(value: &Value) -> usize {
 
 // Marks the final message content block as the Anthropic prompt-cache breakpoint.
 fn enable_anthropic_prompt_caching(body: &mut Value) {
+    // Top-level cache control manages the final breakpoint and its TTL.
+    if body.get("cache_control").is_some() {
+        return;
+    }
     // Abstain once the caller has spent the budget itself. Adding a fifth marker
     // turns a request that was valid on arrival into an upstream HTTP 400, and a
     // caller that placed four breakpoints deliberately needs them more than we
@@ -1234,6 +1337,68 @@ mod tests {
             extra_body: BTreeMap::new(),
             reasoning_effort: None,
             max_retries: 0,
+            timeout: None,
+        }
+    }
+
+    #[test]
+    fn provider_endpoint_urls_preserve_query_and_fragment() {
+        let invalid_url = "not a URL/";
+        let backend = Backend::OpenAiResponses(config(invalid_url));
+        assert!(openai_url(invalid_url, "/responses").is_err());
+        assert_eq!(backend.url(), invalid_url);
+        assert_eq!(
+            AuxiliaryOperation::ResponsesCompact.url(&backend),
+            invalid_url
+        );
+
+        let anthropic = Backend::Anthropic(config(invalid_url));
+        assert_eq!(anthropic.url(), invalid_url);
+        assert_eq!(anthropic.count_tokens_url(), invalid_url);
+
+        for path in ["", "/v1/", "/v1/messages"] {
+            for tail in [
+                "",
+                "?api-version=2026-09-01&value=%2F/",
+                "#fragment?value=/",
+            ] {
+                let base_url = format!("https://example.com{path}{tail}");
+                let backend = Backend::Anthropic(config(&base_url));
+                assert_eq!(
+                    backend.url(),
+                    format!("https://example.com/v1/messages{tail}")
+                );
+                assert_eq!(
+                    AuxiliaryOperation::AnthropicCountTokens.url(&backend),
+                    format!("https://example.com/v1/messages/count_tokens{tail}")
+                );
+            }
+        }
+
+        for path in ["/v1", "/v1/responses/", "/v1/chat/completions"] {
+            for tail in [
+                "",
+                "?api-version=2026-09-01&value=%2F/",
+                "#fragment?value=/",
+            ] {
+                let base_url = format!("https://example.com{path}{tail}");
+                let responses = Backend::OpenAiResponses(config(&base_url));
+                let chat = Backend::OpenAiChat(config(&base_url));
+                for (actual, endpoint) in [
+                    (responses.url(), "/responses"),
+                    (chat.url(), "/chat/completions"),
+                    (
+                        AuxiliaryOperation::ResponsesCompact.url(&responses),
+                        "/responses/compact",
+                    ),
+                    (
+                        AuxiliaryOperation::ResponsesInputTokens.url(&responses),
+                        "/responses/input_tokens",
+                    ),
+                ] {
+                    assert_eq!(actual, format!("https://example.com/v1{endpoint}{tail}"));
+                }
+            }
         }
     }
 
@@ -1397,6 +1562,14 @@ mod tests {
 
     #[test]
     fn anthropic_prompt_caching_marks_final_message() {
+        let caller_managed = json!({
+            "cache_control": {"type": "ephemeral", "ttl": "1h"},
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        let mut body = caller_managed.clone();
+        enable_anthropic_prompt_caching(&mut body);
+        assert_eq!(body, caller_managed);
+
         let mut body = json!({
             "messages": [{"role": "user", "content": "hello"}]
         });
@@ -2272,6 +2445,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deadline_expires_before_send_or_stream_poll()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                "data: {\"id\":\"test\",\"model\":\"gpt\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+                "text/event-stream",
+            ))
+            .mount(&server)
+            .await;
+        for timeout in [Duration::ZERO, Duration::from_millis(200)] {
+            let mut backend = config(&server.uri());
+            backend.timeout = Some(timeout);
+            let client = TranslatingLlmClient::new(&[ModelConfig::new(
+                "gpt",
+                Backend::OpenAiChat(backend),
+                None,
+            )])?;
+            let result = client
+                .call_rewrite_model(request_for(Some("gpt"), true), None)
+                .await;
+            if timeout.is_zero() {
+                assert!(matches!(result, Err(LlmClientError::Timeout { .. })));
+                assert!(
+                    server
+                        .received_requests()
+                        .await
+                        .expect("recorded requests")
+                        .is_empty()
+                );
+            } else {
+                let LlmResponse::Stream(mut chunks) = result?.llm_response else {
+                    return Err("expected a streaming response".into());
+                };
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                assert!(matches!(
+                    chunks.next().await,
+                    Some(Err(LlmClientError::Timeout { .. }))
+                ));
+                assert!(chunks.next().await.is_none());
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn timeout_is_retried_before_a_response_is_returned()
     -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
         let server = MockServer::start().await;
@@ -2503,6 +2722,42 @@ mod tests {
             error,
             LlmClientError::ContextWindowExceeded { model, .. } if model == "gpt"
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn content_policy_400_preserves_upstream_error()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        let body = json!({
+            "error": {
+                "code": "content_policy_violation",
+                "message": "request blocked by content policy",
+                "type": "invalid_request_error"
+            },
+            "metadata": {"documentation_section": "context window"}
+        });
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(&body))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = TranslatingLlmClient::new(&chat_map(&format!("{}/v1", server.uri())))?;
+        let Err(error) = client
+            .call_rewrite_model(request_for(Some("gpt"), false), None)
+            .await
+        else {
+            panic!("expected a policy denial");
+        };
+        let LlmClientError::UpstreamHttp {
+            status,
+            body: actual,
+        } = error
+        else {
+            panic!("expected the upstream HTTP error, got {error:?}");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&actual)?, body);
         Ok(())
     }
 

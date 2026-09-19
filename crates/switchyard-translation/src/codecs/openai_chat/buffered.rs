@@ -26,8 +26,8 @@ use crate::llm::{
 use crate::policy::{DeterministicIdPolicy, TranslationPolicy};
 use crate::util::{
     capture_request_preservation, capture_response_preservation, embed_preservation,
-    exact_preserved_request, exact_preserved_response, json_string, object, push_lossy, stable_id,
-    string_value, validate_request_capabilities,
+    exact_preserved_request, exact_preserved_response, json_string, object, push_lossy,
+    reject_responses_builtin_tool_item, stable_id, string_value, validate_request_capabilities,
 };
 
 /// Format codec for OpenAI Chat Completions payloads.
@@ -196,6 +196,19 @@ impl FormatCodec for OpenAiChatCodec {
         }
         let mut diagnostics = Vec::new();
         validate_request_capabilities(request, &mut diagnostics, policy)?;
+        let allowed = match &request.tool_choice {
+            Some(ToolChoice::Raw(choice))
+                if choice.get("type").and_then(Value::as_str) == Some("allowed_tools")
+                    && choice.get("allowed_tools").is_some() =>
+            {
+                None
+            }
+            _ => crate::codecs::common::allowed_function_tools(request)?,
+        };
+        let (tools, tool_choice) = allowed.as_ref().map_or(
+            (request.tools.as_slice(), request.tool_choice.as_ref()),
+            |(tools, choice)| (tools.as_slice(), Some(choice)),
+        );
         let mut body = Map::new();
         if let Some(model) = &request.model {
             body.insert("model".to_string(), Value::String(model.clone()));
@@ -217,9 +230,9 @@ impl FormatCodec for OpenAiChatCodec {
         }
         body.insert("messages".to_string(), Value::Array(messages));
 
-        if !request.tools.is_empty() {
-            body.insert("tools".to_string(), encode_openai_tools(&request.tools));
-            if let Some(choice) = &request.tool_choice {
+        if !tools.is_empty() {
+            body.insert("tools".to_string(), encode_openai_tools(tools));
+            if let Some(choice) = tool_choice {
                 body.insert("tool_choice".to_string(), encode_openai_tool_choice(choice));
             }
         }
@@ -287,13 +300,17 @@ impl FormatCodec for OpenAiChatCodec {
                 .and_then(Value::as_object)
                 .cloned()
                 .unwrap_or_default();
-            let mut content = decode_openai_content(
-                message.get("content").unwrap_or(&Value::Null),
-                WireFormat::OpenAiChat,
-                &mut Vec::new(),
-                &TranslationPolicy::default(),
-                "$.choices[0].message.content",
-            )?;
+            let mut content = match message.get("content") {
+                // decode_openai_content would turn absent response text into an empty text block.
+                None | Some(Value::Null) => Vec::new(),
+                Some(content) => decode_openai_content(
+                    content,
+                    WireFormat::OpenAiChat,
+                    &mut Vec::new(),
+                    &TranslationPolicy::default(),
+                    "$.choices[0].message.content",
+                )?,
+            };
             prepend_openai_reasoning_blocks(&mut content, &message);
             if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
                 for (index, tool_call) in tool_calls.iter().enumerate() {
@@ -307,6 +324,16 @@ impl FormatCodec for OpenAiChatCodec {
                 }
             }
             response.outputs.push(ResponseOutput {
+                url_citations: message
+                    .get("annotations")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter(|annotation| annotation["type"] == "url_citation")
+                    .filter_map(|annotation| {
+                        serde_json::from_value(annotation["url_citation"].clone()).ok()
+                    })
+                    .collect(),
                 role: Role::Assistant,
                 content,
                 stop_reason: Some(map_openai_finish_reason(
@@ -326,6 +353,7 @@ impl FormatCodec for OpenAiChatCodec {
         response: &AggLlmResponse,
         _policy: &TranslationPolicy,
     ) -> Result<EncodedResponse> {
+        super::super::responses::validate_response_output(response, WireFormat::OpenAiChat)?;
         if let Some(body) =
             exact_preserved_response(&response.preservation, WireFormat::OpenAiChat, _policy)
         {
@@ -365,6 +393,15 @@ impl FormatCodec for OpenAiChatCodec {
                 Value::String(content)
             },
         });
+        if let Some(output) = output.filter(|output| !output.url_citations.is_empty()) {
+            message["annotations"] = Value::Array(
+                output
+                    .url_citations
+                    .iter()
+                    .map(|citation| json!({"type": "url_citation", "url_citation": citation}))
+                    .collect(),
+            );
+        }
         if let Some(reasoning) = output
             .map(|output| reasoning_text_from_blocks(&output.content, "\n"))
             .filter(|reasoning| !reasoning.is_empty())
@@ -527,6 +564,9 @@ pub(crate) fn decode_openai_content(
                             content.push(ContentBlock::Image { source });
                         }
                     }
+                    Some("input_audio") => content.push(ContentBlock::Audio {
+                        source: MediaSource::Raw(Value::Object(block.clone())),
+                    }),
                     Some("file") | Some("input_file") => {
                         content.push(ContentBlock::File {
                             source: decode_file_source(block),
@@ -587,7 +627,7 @@ pub(crate) fn decode_image_source(block: &Map<String, Value>) -> Option<ImageSou
                 .map(ToOwned::to_owned),
         });
     }
-    None
+    Some(ImageSource::Raw(Value::Object(block.clone())))
 }
 
 /// Decodes OpenAI file block shapes into normalized file sources.
@@ -1007,6 +1047,7 @@ pub(crate) fn encode_openai_content(
     }
     let mut blocks = Vec::new();
     for block in content {
+        crate::codecs::openai_media::validate_media(block, WireFormat::OpenAiChat)?;
         match block {
             ContentBlock::Text { text } => blocks.push(json!({"type": "text", "text": text})),
             ContentBlock::Refusal { text } => blocks.push(json!({"type": "text", "text": text})),
@@ -1033,12 +1074,7 @@ pub(crate) fn encode_openai_content(
                 }
             },
             ContentBlock::Audio { source } => {
-                push_lossy(
-                    diagnostics,
-                    policy,
-                    "OpenAI Chat codec does not have a stable audio request mapping yet",
-                )?;
-                blocks.push(openai_text_part(&media_source_text(source)));
+                blocks.push(crate::codecs::openai_media::audio_part(source)?);
             }
             ContentBlock::Video { source } => {
                 push_lossy(
@@ -1048,7 +1084,8 @@ pub(crate) fn encode_openai_content(
                 )?;
                 blocks.push(openai_text_part(&media_source_text(source)));
             }
-            ContentBlock::Unknown { raw, .. } => {
+            ContentBlock::Unknown { provider, raw } => {
+                reject_responses_builtin_tool_item(provider, raw, WireFormat::OpenAiChat)?;
                 push_lossy(
                     diagnostics,
                     policy,

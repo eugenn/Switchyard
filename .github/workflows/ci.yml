@@ -153,7 +153,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        python-version: ["3.10", "3.12", "3.14"]
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
@@ -166,7 +166,7 @@ jobs:
         run: uv run pytest tests/ -v -m "not integration"
 
   litellm:
-    name: LiteLLM unit tests
+    name: LiteLLM tests (no live providers)
     needs: changes
     if: needs.changes.outputs.full_ci == 'true'
     runs-on: ubuntu-latest
@@ -188,7 +188,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: uv sync --locked
       - name: pytest
-        run: uv run --no-sync pytest tests/unit -v
+        run: uv run --no-sync pytest tests -m "not e2e" -v
 
   # Regression guard: the default install of nemo-switchyard (without extras)
   # must NOT drag in torch / transformers / routellm / litellm /

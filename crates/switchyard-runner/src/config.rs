@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use libsy::RuntimeModels;
 use serde::de::DeserializeOwned;
@@ -347,12 +348,25 @@ impl DeploymentConfig {
         route: &RouteConfig,
         clients: &BTreeMap<String, Arc<TranslatingLlmClient>>,
     ) -> RunnerResult<(ClientRouter, Option<CallerAuthKind>)> {
+        let TargetPromptPolicy {
+            prompts,
+            routing_answer_target,
+        } = self.build_route_target_prompts(route_name, route)?;
         let mut by_model = HashMap::new();
+        let mut targets_by_model: HashMap<&str, (&str, &TargetConfig)> = HashMap::new();
         let mut caller_auth = None;
         for name in route.callable_target_names() {
             let target = self.targets.get(name).ok_or_else(|| {
                 RunnerError::configuration(format!("route references unknown target {name}"))
             })?;
+            if let Some((first_name, first)) = targets_by_model.insert(&target.id, (name, target))
+                && first.llm_client != target.llm_client
+            {
+                return Err(RunnerError::configuration(format!(
+                    "route {route_name} targets {first_name} and {name} use model {} on different llm clients; execution is keyed by model id, so use distinct model ids within this route or put these targets in separate routes",
+                    target.id
+                )));
+            }
             let client = clients.get(&target.llm_client).ok_or_else(|| {
                 RunnerError::configuration(format!("target {name} has no constructed llm client"))
             })?;
@@ -374,12 +388,17 @@ impl DeploymentConfig {
             let client: Arc<dyn RoutedLlmClient> = client.clone();
             by_model.insert(target.id.clone(), client);
         }
-        let TargetPromptPolicy {
+        let completion_targets = route
+            .routing_target_names()
+            .into_iter()
+            .map(|name| self.targets[name].id.clone())
+            .collect::<Vec<_>>();
+        let router = ClientRouter::new_with_completion_targets(
+            by_model,
             prompts,
             routing_answer_target,
-        } = self.build_route_target_prompts(route_name, route)?;
-        let router =
-            ClientRouter::new_with_target_prompts(by_model, prompts, routing_answer_target);
+            &completion_targets,
+        );
         Ok((router, caller_auth))
     }
 
@@ -549,6 +568,8 @@ struct LlmClientConfig {
     extra_headers: BTreeMap<String, String>,
     #[serde(default = "default_max_retries")]
     max_retries: u32,
+    /// Deadline in milliseconds for all attempts and the complete response. Unset is unbounded.
+    timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -625,6 +646,11 @@ fn build_backend(
             "llm client {client_name} max_retries must be at most {MAX_CONFIGURED_RETRIES}"
         )));
     }
+    if config.timeout_ms == Some(0) {
+        return Err(RunnerError::configuration(format!(
+            "llm client {client_name} timeout_ms must be at least 1"
+        )));
+    }
     if config.forward_auth && config.api_key_env.is_some() {
         return Err(RunnerError::configuration(format!(
             "llm client {client_name} cannot set both forward_auth and api_key_env"
@@ -660,6 +686,7 @@ fn build_backend(
         extra_body: extra_body.clone(),
         reasoning_effort,
         max_retries: config.max_retries,
+        timeout: config.timeout_ms.map(Duration::from_millis),
     };
     let backend = match config.format {
         ClientFormat::OpenAiChat => Backend::OpenAiChat(http),
@@ -1078,17 +1105,22 @@ new = ["send_message"]
 
     #[test]
     fn rejects_invalid_unreferenced_llm_client() {
-        let invalid = format!(
-            "{VALID_CONFIG}\n\
-             [llm_clients.unused]\n\
-             format = \"openai_chat\"\n\
-             base_url = \"not a url\"\n"
-        );
-        let message = error_message(&invalid);
-        assert!(
-            message.contains("base_url must be an absolute HTTP(S) URL"),
-            "unexpected error: {message}"
-        );
+        for (settings, expected) in [
+            (
+                "base_url = \"not a url\"",
+                "base_url must be an absolute HTTP(S) URL",
+            ),
+            (
+                "base_url = \"https://example.test\"\ntimeout_ms = 0",
+                "timeout_ms must be at least 1",
+            ),
+        ] {
+            let invalid = format!(
+                "{VALID_CONFIG}\n[llm_clients.unused]\nformat = \"openai_chat\"\n{settings}"
+            );
+            let message = error_message(&invalid);
+            assert!(message.contains(expected), "unexpected error: {message}");
+        }
     }
 
     #[test]
@@ -1482,9 +1514,7 @@ target = "smart"
 
     #[test]
     fn accepts_same_model_id_on_different_llm_clients() -> RunnerResult<()> {
-        // The same model id served by two llm clients never collides (each client keys its own
-        // models), so cross-provider A/B builds with no warning; only a repeat within one client
-        // warns.
+        // Separate routes may serve the same model through different clients.
         const CROSS_PROVIDER: &str = r#"
 schema_version = 1
 
@@ -1515,6 +1545,27 @@ type = "passthrough"
 target = "azure"
 "#;
         runner_from_toml(CROSS_PROVIDER)?;
+        let shared_route = format!(
+            r#"{CROSS_PROVIDER}
+
+[routes.shared]
+id = "switchyard/shared"
+type = "stage_router"
+capable_target = "openai"
+efficient_target = "azure"
+picker = "efficient_first"
+confidence_threshold = 0.5
+"#
+        );
+        let message = error_message(&shared_route);
+        assert!(
+            message.contains("route shared")
+                && message.contains("openai")
+                && message.contains("azure")
+                && message.contains("gpt-4o")
+                && message.contains("different llm clients"),
+            "{message}"
+        );
         Ok(())
     }
 
@@ -1569,6 +1620,27 @@ target = "azure"
                 .and_then(|value| value.get("enable_thinking")),
             Some(&json!(false))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn client_deadline_defaults_and_rejects_zero() -> RunnerResult<()> {
+        for (setting, expected) in [
+            ("", None),
+            ("timeout_ms = 1500", Some(1500)),
+            ("timeout_ms = 0", Some(0)),
+        ] {
+            let source = format!(
+                "format = \"openai_chat\"\nbase_url = \"https://example.test/v1\"\n{setting}"
+            );
+            let config: LlmClientConfig = toml::from_str(&source).expect("valid deadline config");
+            let backend = build_backend("test", &config, &BTreeMap::new(), None);
+            if expected == Some(0) {
+                assert!(backend.is_err());
+            } else {
+                assert_eq!(backend?.timeout(), expected.map(Duration::from_millis));
+            }
+        }
         Ok(())
     }
 
