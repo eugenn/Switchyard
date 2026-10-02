@@ -4,7 +4,10 @@
 //! Per-provider backend configuration: wire format, upstream URL, and auth.
 
 use std::time::Duration;
-use std::{collections::BTreeMap, fmt};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+};
 
 use reqwest::RequestBuilder;
 use reqwest::header::{HeaderName, HeaderValue};
@@ -59,12 +62,18 @@ pub struct HttpBackendConfig {
     pub extra_headers: BTreeMap<String, String>,
     /// Default top-level request fields, applied only when the request omits the key.
     pub extra_body: BTreeMap<String, Value>,
+    /// Top-level request fields dropped from the outbound body before `extra_body` is merged,
+    /// so a target can reinstate one deliberately. For providers that reject an otherwise
+    /// standard field (e.g. an internal API that 400s on `max_output_tokens`).
+    pub omit_body_fields: BTreeSet<String>,
     /// Reasoning effort forced on every request to this backend, replacing whatever the caller
     /// sent. Responses carries it as `reasoning.effort`, Chat Completions as `reasoning_effort`;
     /// Anthropic has no equivalent and rejects the setting at configuration time.
     pub reasoning_effort: Option<String>,
     /// Additional attempts after the initial upstream request.
     pub max_retries: u32,
+    /// Cooldown after an exhausted transient completion failure. Zero disables it.
+    pub failure_cooldown: Duration,
     /// Deadline for one complete response, including retries, retry delays, and stream reads.
     /// `None` leaves the wait unbounded.
     pub timeout: Option<Duration>,
@@ -78,8 +87,10 @@ impl fmt::Debug for HttpBackendConfig {
             .field("forward_auth", &self.forward_auth)
             .field("extra_header_names", &self.extra_headers.keys())
             .field("extra_body_keys", &self.extra_body.keys())
+            .field("omit_body_fields", &self.omit_body_fields)
             .field("reasoning_effort", &self.reasoning_effort)
             .field("max_retries", &self.max_retries)
+            .field("failure_cooldown", &self.failure_cooldown)
             .field("timeout", &self.timeout)
             .finish()
     }
@@ -296,6 +307,11 @@ impl Backend {
         &self.config().extra_body
     }
 
+    /// Top-level fields dropped from outbound request bodies before `extra_body` is merged.
+    pub fn omit_body_fields(&self) -> &BTreeSet<String> {
+        &self.config().omit_body_fields
+    }
+
     /// Reasoning effort forced on outbound requests, if the target configures one.
     pub fn reasoning_effort(&self) -> Option<&str> {
         self.config().reasoning_effort.as_deref()
@@ -304,6 +320,11 @@ impl Backend {
     /// Additional attempts allowed after the initial request.
     pub fn max_retries(&self) -> u32 {
         self.config().max_retries
+    }
+
+    /// Cooldown after an exhausted transient completion failure.
+    pub fn failure_cooldown(&self) -> Duration {
+        self.config().failure_cooldown
     }
 
     /// Deadline for all attempts and the complete response; `None` leaves the wait unbounded.
@@ -415,8 +436,10 @@ mod tests {
             forward_auth: false,
             extra_headers: BTreeMap::new(),
             extra_body: BTreeMap::new(),
+            omit_body_fields: BTreeSet::new(),
             reasoning_effort: None,
             max_retries: 0,
+            failure_cooldown: Duration::ZERO,
             timeout: None,
         }
     }
