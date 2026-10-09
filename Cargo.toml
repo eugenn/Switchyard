@@ -4,6 +4,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "examples/dynamo-preproc",
     "crates/libsy",
     "crates/libsy-llm-client",
     "crates/prefill-router",
@@ -11,6 +12,7 @@ members = [
     "crates/protocol",
     "crates/switchyard-nemo-relay-plugin",
     "crates/switchyard-runner",
+    "crates/switchyard-menubar",
     "crates/switchyard-server",
     "crates/switchyard-skill-distillation",
     "crates/switchyard-soak",
