@@ -731,7 +731,20 @@ fn decode_responses_input(
                     Some("additional_tools") => {}
                     _ => {
                         let message = Message {
-                            role: Role::User,
+                            role: match item_type {
+                                Some(
+                                    "shell_call"
+                                    | "apply_patch_call"
+                                    | "computer_call"
+                                    | "image_generation_call",
+                                ) => Role::Assistant,
+                                Some(
+                                    "shell_call_output"
+                                    | "apply_patch_call_output"
+                                    | "computer_call_output",
+                                ) => Role::Tool,
+                                _ => Role::User,
+                            },
                             content: vec![ContentBlock::Unknown {
                                 provider: WireFormat::OpenAiResponses.into(),
                                 raw: Value::Object(item.clone()),
@@ -1277,6 +1290,8 @@ fn encode_responses_input(
     // custom outputs. A tool result is typed by the call it answers, and Responses history
     // always lists the call before its output, so recording ids as calls are encoded is enough
     // to type the outputs that follow.
+    //
+    // A lone user text is still sent as an item list: the Codex backend rejects a string `input`.
     let mut encoded = Vec::new();
     // Some upstream translators (Kimi K3) resolve a tool output by an explicit
     // `name`, so pair every output with the name of the call it answers.
@@ -1291,8 +1306,7 @@ fn encode_responses_input(
     for message in messages {
         // The decoder carries each valid top-level built-in tool item as one
         // provider-qualified block, so replay that block in place.
-        if message.role == Role::User
-            && let [ContentBlock::Unknown { provider, raw }] = message.content.as_slice()
+        if let [ContentBlock::Unknown { provider, raw }] = message.content.as_slice()
             && provider.as_str() == WireFormat::OpenAiResponses.as_str()
             && is_responses_builtin_tool_item(raw)
         {
